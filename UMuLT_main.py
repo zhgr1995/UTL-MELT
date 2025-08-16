@@ -24,7 +24,7 @@ from sklearn.metrics import recall_score
 
 # ---------- 1 配置 ----------
 CONFIG: Dict = {
-    "num_classes":        7,#七个情感分类标签
+    "num_classes":        7,#情感分类标签数目
     "batch_size":         36,#最大就64吧
     "epochs_stage1":      12, # Adapter 预训练轮次
     "epochs_stage2":      24,# 全量训练轮次
