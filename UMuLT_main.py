@@ -332,72 +332,133 @@ class UTL_MELT(nn.Module):
         u_stack = torch.cat((K / a0_t, K / a0_a, K / a0_v), dim=1)  # [B,3]
 
         # prefix gating
-        # 1. 计算归一化belief（论文Eq. 8）
-        eps_norm = 1e-6  # 防止除零的小常数
-        b_sum_t = bm_t.sum(1, keepdim=True)  # [B, 1]
-        b_sum_a = bm_a.sum(1, keepdim=True)
-        b_sum_v = bm_v.sum(1, keepdim=True)
+    def forward(self, text, audio, video, return_intermediates=False):
+        # 编码各模态特征
+        ft0 = self.txt(text)
+        fa0 = self.aud(audio)
+        fv0 = self.vis(video)
+    
+        # —— 模态 on/off 消融 ——
+        if not self.CONFIG["enable_text"]:
+            ft0 = torch.zeros_like(ft0)
+        if not self.CONFIG["enable_audio"]:
+            fa0 = torch.zeros_like(fa0)
+        if not self.CONFIG["enable_video"]:
+            fv0 = torch.zeros_like(fv0)
+    
+        # —— 可消融的跨模态对齐 ——
+        if self.CONFIG["enable_cross_modal_align"]:
+            # Text查询Audio+Visual的拼接
+            ft1 = self.align_t(ft0, torch.cat([fa0, fv0], dim=-1))
+            # Audio查询Text+Visual的拼接
+            fa1 = self.align_a(fa0, torch.cat([ft0, fv0], dim=-1))
+            # Visual查询Text+Audio的拼接
+            fv1 = self.align_v(fv0, torch.cat([ft0, fa0], dim=-1))
+        else:
+            ft1, fa1, fv1 = ft0, fa0, fv0
+    
+        # 适配器
+        ft = self.adp_t(ft1)
+        fa = self.adp_a(fa1)
+        fv = self.adp_v(fv1)
+    
+        # 生成 evidence
+        et = self.eh_t(ft)
+        ea = self.eh_a(fa)
+        ev = self.eh_v(fv)
+        E = torch.stack((et, ea, ev), dim=1)  # [B, 3, K]
+    
+        # ========== 开始修正的融合逻辑 ==========
+        K = self.CONFIG['num_classes']
+        eps = self.CONFIG['eps']
         
-        # 当 1-u_m >= eps_norm 时归一化，否则退化为均匀分布
+        # Step 1: 计算Dirichlet参数和不确定性（论文Eq. 6）
+        alpha_t = et + 1.0  # [B, K]
+        alpha_a = ea + 1.0
+        alpha_v = ev + 1.0
+        
+        S_t = alpha_t.sum(dim=1, keepdim=True)  # [B, 1]
+        S_a = alpha_a.sum(dim=1, keepdim=True)
+        S_v = alpha_v.sum(dim=1, keepdim=True)
+        
+        u_t = K / S_t  # [B, 1] 不确定性
+        u_a = K / S_a
+        u_v = K / S_v
+        
+        # Step 2: 计算belief mass（论文Eq. 7）
+        bm_t = et / S_t  # [B, K]
+        bm_a = ea / S_a
+        bm_v = ev / S_v
+        
+        # Step 3: 归一化belief用于冲突度计算（论文Eq. 8）
+        # 当 u_m 接近1时（无证据），退化为均匀分布
+        eps_norm = 1e-6
+        belief_sum_t = bm_t.sum(dim=1, keepdim=True)  # [B, 1]，应≈1-u_m
+        belief_sum_a = bm_a.sum(dim=1, keepdim=True)
+        belief_sum_v = bm_v.sum(dim=1, keepdim=True)
+        
         b_tilde_t = torch.where(
-            b_sum_t >= eps_norm,
-            bm_t / (b_sum_t + eps_norm),
+            belief_sum_t >= eps_norm,
+            bm_t / (belief_sum_t + eps_norm),
             torch.ones_like(bm_t) / K
-        )
+        )  # [B, K]
         b_tilde_a = torch.where(
-            b_sum_a >= eps_norm,
-            bm_a / (b_sum_a + eps_norm),
+            belief_sum_a >= eps_norm,
+            bm_a / (belief_sum_a + eps_norm),
             torch.ones_like(bm_a) / K
         )
         b_tilde_v = torch.where(
-            b_sum_v >= eps_norm,
-            bm_v / (b_sum_v + eps_norm),
+            belief_sum_v >= eps_norm,
+            bm_v / (belief_sum_v + eps_norm),
             torch.ones_like(bm_v) / K
         )
         
-        # 2. 计算冲突度（论文Eq. 9：C_m = 1 - <b̃_m, b̃_prev(m)>）
-        C_a = 1.0 - (b_tilde_a * b_tilde_t).sum(1)  # Audio vs Text
-        C_v = 1.0 - (b_tilde_v * b_tilde_a).sum(1)  # Visual vs Audio
+        # Step 4: 计算冲突度（论文Eq. 9）
+        # C_m = 1 - <b̃_m, b̃_prev(m)>
+        C_a = 1.0 - (b_tilde_a * b_tilde_t).sum(dim=1)  # [B] Audio vs Text
+        C_v = 1.0 - (b_tilde_v * b_tilde_a).sum(dim=1)  # [B] Visual vs Audio
         
-        # 将冲突度限制在[0, 1]区间
+        # 限制在[0,1]区间
         C_a = torch.clamp(C_a, 0.0, 1.0)
         C_v = torch.clamp(C_v, 0.0, 1.0)
         
-        # 3. 提取不确定性
-        u_t = (K / a0_t).squeeze(1)  # [B]
-        u_a = (K / a0_a).squeeze(1)
-        u_v = (K / a0_v).squeeze(1)
+        # Step 5: 计算prefix权重（论文Eq. 10）
+        u_t_scalar = u_t.squeeze(1)  # [B]
+        u_a_scalar = u_a.squeeze(1)
+        u_v_scalar = u_v.squeeze(1)
         
-        # 4. 计算prefix权重（论文Eq. 10）
-        w_t = 1.0 - u_t              # Text: 1 - u^(1)
-        w_a = (1.0 - u_a) * (1.0 - C_a)  # Audio: (1-u^(2))(1-C^(2))
-        w_v = (1.0 - u_v) * (1.0 - C_v)  # Visual: (1-u^(3))(1-C^(3))
+        w_t = 1.0 - u_t_scalar              # Text: 1 - u^(1)
+        w_a = (1.0 - u_a_scalar) * (1.0 - C_a)  # Audio: (1-u^(2))(1-C^(2))
+        w_v = (1.0 - u_v_scalar) * (1.0 - C_v)  # Visual: (1-u^(3))(1-C^(3))
         
-        # 5. 堆叠为[B, 3]用于后续归一化
         w_pref = torch.stack([w_t, w_a, w_v], dim=1)  # [B, 3]
         
-        # 6. Temperature-controlled softmax（论文Eq. 11）
-        a_tilde = F.softmax(w_pref / self.CONFIG['prefix_temp'], dim=1)
-
-        # —— 可消融的不确定性门控 ——
+        # Step 6: Temperature-controlled softmax（论文Eq. 11）
+        a_tilde = F.softmax(w_pref / self.CONFIG['prefix_temp'], dim=1)  # [B, 3]
+        
+        # Step 7: 不确定性门控（论文Eq. 12）
+        u_stack = torch.cat([u_t, u_a, u_v], dim=1)  # [B, 3]
+        
         if self.CONFIG["enable_uncertainty_gate"]:
-            reliable = (u_stack <= self.CONFIG['tau_unc']).float()
+            tau = self.CONFIG['tau_unc']
+            kappa = self.CONFIG['kappa']
+            
+            reliable = (u_stack <= tau).float()
             w_unc = reliable + (1 - reliable) * torch.clamp(
-                1 - self.CONFIG['kappa'] * (u_stack - self.CONFIG['tau_unc']),
+                1.0 - kappa * (u_stack - tau),
                 min=0.01
-            )  # [B,3]
+            )  # [B, 3]
         else:
-            # 关闭门控时均分权重
-            w_unc = torch.ones_like(u_stack) / u_stack.size(1)
-
-        # hybrid fusion
-        w_hat = a_tilde * w_unc
-        wexp = w_hat * torch.exp(-u_stack)
-        alpha = wexp / (wexp.sum(1, keepdim=True) + self.CONFIG['eps'])  # [B,3]
-        e_final = (alpha.unsqueeze(-1) * E).sum(1)  # [B,K]
-
-
-        # 返回中间量以便调试
+            w_unc = torch.ones_like(u_stack) / 3.0
+        
+        # Step 8: 混合融合（论文Eq. 13-14）
+        w_hat = a_tilde * w_unc  # [B, 3]
+        wexp = w_hat * torch.exp(-u_stack)  # [B, 3]
+        alpha = wexp / (wexp.sum(dim=1, keepdim=True) + eps)  # [B, 3] 最终权重
+        
+        e_final = (alpha.unsqueeze(-1) * E).sum(dim=1)  # [B, K]
+        
+        # 返回
         if return_intermediates:
             return e_final, (et, ea, ev), u_stack
         else:
