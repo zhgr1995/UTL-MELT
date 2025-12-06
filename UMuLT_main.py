@@ -242,16 +242,22 @@ class CrossAttn(nn.Module):
     def __init__(self, d_model=256, n_heads=4):
         super().__init__()
         self.q = nn.Linear(d_model, d_model)
-        self.k = nn.Linear(d_model, d_model)
-        self.v = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(2 * d_model, d_model)  # KV输入=2*d_model
+        self.v = nn.Linear(2 * d_model, d_model)  # 适配拼接维度
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.out  = nn.Linear(d_model, d_model)
-    def forward(self, q_in, x_in):
-        q = self.q(q_in).unsqueeze(1)
-        k = self.k(x_in).unsqueeze(1)
-        v = self.v(x_in).unsqueeze(1)
-        y,_ = self.attn(q,k,v,need_weights=False)
-        return self.out(y.squeeze(1))
+    
+    def forward(self, q_in, kv_in):
+        """
+        Args:
+            q_in: [B, d_model] 查询模态
+            kv_in: [B, 2*d_model] 拼接的键值模态
+        """
+        q = self.q(q_in).unsqueeze(1)      # [B, 1, d_model]
+        k = self.k(kv_in).unsqueeze(1)     # [B, 1, d_model]
+        v = self.v(kv_in).unsqueeze(1)     # [B, 1, d_model]
+        y, _ = self.attn(q, k, v, need_weights=False)
+        return self.out(y.squeeze(1))      # [B, d_model]
 
 class EvidenceHead(nn.Module):
     def __init__(self, d, num_cls): super().__init__(); self.fc=nn.Linear(d,num_cls)
@@ -296,9 +302,14 @@ class UTL_MELT(nn.Module):
 
         # —— 可消融的跨模态对齐 ——
         if self.CONFIG["enable_cross_modal_align"]:
-            ft1 = self.align_t(ft0, fa0)
-            fa1 = self.align_a(fa0, fv0)
-            fv1 = self.align_v(fv0, ft0)
+            # Text查询Audio+Visual的拼接
+            ft1 = self.align_t(ft0, torch.cat([fa0, fv0], dim=-1))
+            
+            # Audio查询Text+Visual的拼接
+            fa1 = self.align_a(fa0, torch.cat([ft0, fv0], dim=-1))
+            
+            # Visual查询Text+Audio的拼接
+            fv1 = self.align_v(fv0, torch.cat([ft0, fa0], dim=-1))
         else:
             ft1, fa1, fv1 = ft0, fa0, fv0
 
@@ -321,33 +332,51 @@ class UTL_MELT(nn.Module):
         u_stack = torch.cat((K / a0_t, K / a0_a, K / a0_v), dim=1)  # [B,3]
 
         # prefix gating
-        bm_t = et / a0_t                      # 
-        bm_a = ea / a0_a                      #
-        bm_v = ev / a0_v                      # 
-
-        # ── 冲突度  ──
-        # 计算 Audio 相对 Text 的冲突
-        outer_at = torch.bmm(bm_a.unsqueeze(2), bm_t.unsqueeze(1))      
-        C_a = outer_at.sum((1,2)) - (bm_a * bm_t).sum(1)                 
-
-        # 计算 Visual 相对 Audio 的冲突
-        outer_va = torch.bmm(bm_v.unsqueeze(2), bm_a.unsqueeze(1))    
-        C_v = outer_va.sum((1,2)) - (bm_v * bm_a).sum(1)
-
-        # ── 前缀权重 (Eq. 8-10) ──
-        u_t = (K / a0_t).squeeze(1)
+        # 1. 计算归一化belief（论文Eq. 8）
+        eps_norm = 1e-6  # 防止除零的小常数
+        b_sum_t = bm_t.sum(1, keepdim=True)  # [B, 1]
+        b_sum_a = bm_a.sum(1, keepdim=True)
+        b_sum_v = bm_v.sum(1, keepdim=True)
+        
+        # 当 1-u_m >= eps_norm 时归一化，否则退化为均匀分布
+        b_tilde_t = torch.where(
+            b_sum_t >= eps_norm,
+            bm_t / (b_sum_t + eps_norm),
+            torch.ones_like(bm_t) / K
+        )
+        b_tilde_a = torch.where(
+            b_sum_a >= eps_norm,
+            bm_a / (b_sum_a + eps_norm),
+            torch.ones_like(bm_a) / K
+        )
+        b_tilde_v = torch.where(
+            b_sum_v >= eps_norm,
+            bm_v / (b_sum_v + eps_norm),
+            torch.ones_like(bm_v) / K
+        )
+        
+        # 2. 计算冲突度（论文Eq. 9：C_m = 1 - <b̃_m, b̃_prev(m)>）
+        C_a = 1.0 - (b_tilde_a * b_tilde_t).sum(1)  # Audio vs Text
+        C_v = 1.0 - (b_tilde_v * b_tilde_a).sum(1)  # Visual vs Audio
+        
+        # 将冲突度限制在[0, 1]区间
+        C_a = torch.clamp(C_a, 0.0, 1.0)
+        C_v = torch.clamp(C_v, 0.0, 1.0)
+        
+        # 3. 提取不确定性
+        u_t = (K / a0_t).squeeze(1)  # [B]
         u_a = (K / a0_a).squeeze(1)
-
-        w_a = u_t
-        w_v = w_a * u_a / (1 - C_v + self.CONFIG['eps'])
-
-
-        w_pref = torch.stack((
-            torch.ones_like(w_a),              #
-            w_a,
-            w_v
-        ), dim=1)                             # 
-
+        u_v = (K / a0_v).squeeze(1)
+        
+        # 4. 计算prefix权重（论文Eq. 10）
+        w_t = 1.0 - u_t              # Text: 1 - u^(1)
+        w_a = (1.0 - u_a) * (1.0 - C_a)  # Audio: (1-u^(2))(1-C^(2))
+        w_v = (1.0 - u_v) * (1.0 - C_v)  # Visual: (1-u^(3))(1-C^(3))
+        
+        # 5. 堆叠为[B, 3]用于后续归一化
+        w_pref = torch.stack([w_t, w_a, w_v], dim=1)  # [B, 3]
+        
+        # 6. Temperature-controlled softmax（论文Eq. 11）
         a_tilde = F.softmax(w_pref / self.CONFIG['prefix_temp'], dim=1)
 
         # —— 可消融的不确定性门控 ——
