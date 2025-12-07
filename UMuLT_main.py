@@ -282,17 +282,17 @@ class UTL_MELT(nn.Module):
         self.adp_t = ResidualAdapter(d)
         self.adp_a = ResidualAdapter(d)
         self.adp_v = ResidualAdapter(d)
-        self.eh_t = EvidenceHead(d,num_cls)
-        self.eh_a = EvidenceHead(d,num_cls)
-        self.eh_v = EvidenceHead(d,num_cls)
+        self.eh_t = EvidenceHead(d, num_cls)
+        self.eh_a = EvidenceHead(d, num_cls)
+        self.eh_v = EvidenceHead(d, num_cls)
 
     def forward(self, text, audio, video, return_intermediates=False):
-        # 编码各模态特征
+        # ========== Step 1: 特征提取 ==========
         ft0 = self.txt(text)
         fa0 = self.aud(audio)
         fv0 = self.vis(video)
 
-        # —— 模态 on/off 消融 ——
+        # ========== Step 2: 模态消融开关 ==========
         if not self.CONFIG["enable_text"]:
             ft0 = torch.zeros_like(ft0)
         if not self.CONFIG["enable_audio"]:
@@ -300,53 +300,7 @@ class UTL_MELT(nn.Module):
         if not self.CONFIG["enable_video"]:
             fv0 = torch.zeros_like(fv0)
 
-        # —— 可消融的跨模态对齐 ——
-        if self.CONFIG["enable_cross_modal_align"]:
-            # Text查询Audio+Visual的拼接
-            ft1 = self.align_t(ft0, torch.cat([fa0, fv0], dim=-1))
-            
-            # Audio查询Text+Visual的拼接
-            fa1 = self.align_a(fa0, torch.cat([ft0, fv0], dim=-1))
-            
-            # Visual查询Text+Audio的拼接
-            fv1 = self.align_v(fv0, torch.cat([ft0, fa0], dim=-1))
-        else:
-            ft1, fa1, fv1 = ft0, fa0, fv0
-
-        # 适配器
-        ft = self.adp_t(ft1)
-        fa = self.adp_a(fa1)
-        fv = self.adp_v(fv1)
-
-        # 生成 evidence
-        et = self.eh_t(ft)
-        ea = self.eh_a(fa)
-        ev = self.eh_v(fv)
-        E = torch.stack((et, ea, ev), dim=1)  # [B,3,K]
-
-        # 计算不确定性 u = K / (sum(evidence) + K)
-        K = self.CONFIG['num_classes']
-        a0_t = et.sum(1, keepdim=True) + K
-        a0_a = ea.sum(1, keepdim=True) + K
-        a0_v = ev.sum(1, keepdim=True) + K
-        u_stack = torch.cat((K / a0_t, K / a0_a, K / a0_v), dim=1)  # [B,3]
-
-        # prefix gating
-    def forward(self, text, audio, video, return_intermediates=False):
-        # 编码各模态特征
-        ft0 = self.txt(text)
-        fa0 = self.aud(audio)
-        fv0 = self.vis(video)
-    
-        # —— 模态 on/off 消融 ——
-        if not self.CONFIG["enable_text"]:
-            ft0 = torch.zeros_like(ft0)
-        if not self.CONFIG["enable_audio"]:
-            fa0 = torch.zeros_like(fa0)
-        if not self.CONFIG["enable_video"]:
-            fv0 = torch.zeros_like(fv0)
-    
-        # —— 可消融的跨模态对齐 ——
+        # ========== Step 3: 跨模态对齐（论文Eq. 2-4） ==========
         if self.CONFIG["enable_cross_modal_align"]:
             # Text查询Audio+Visual的拼接
             ft1 = self.align_t(ft0, torch.cat([fa0, fv0], dim=-1))
@@ -356,23 +310,23 @@ class UTL_MELT(nn.Module):
             fv1 = self.align_v(fv0, torch.cat([ft0, fa0], dim=-1))
         else:
             ft1, fa1, fv1 = ft0, fa0, fv0
-    
-        # 适配器
+
+        # ========== Step 4: 适配器（论文Eq. 1+5） ==========
         ft = self.adp_t(ft1)
         fa = self.adp_a(fa1)
         fv = self.adp_v(fv1)
-    
-        # 生成 evidence
-        et = self.eh_t(ft)
+
+        # ========== Step 5: 生成Evidence（论文Eq. 6） ==========
+        et = self.eh_t(ft)  # [B, K]
         ea = self.eh_a(fa)
         ev = self.eh_v(fv)
         E = torch.stack((et, ea, ev), dim=1)  # [B, 3, K]
-    
-        # ========== 开始修正的融合逻辑 ==========
+
+        # ========== Step 6: 证据融合（论文Eq. 6-14） ==========
         K = self.CONFIG['num_classes']
         eps = self.CONFIG['eps']
         
-        # Step 1: 计算Dirichlet参数和不确定性（论文Eq. 6）
+        # 6.1 计算Dirichlet参数和不确定性（论文Eq. 6）
         alpha_t = et + 1.0  # [B, K]
         alpha_a = ea + 1.0
         alpha_v = ev + 1.0
@@ -385,13 +339,12 @@ class UTL_MELT(nn.Module):
         u_a = K / S_a
         u_v = K / S_v
         
-        # Step 2: 计算belief mass（论文Eq. 7）
+        # 6.2 计算belief mass（论文Eq. 7）
         bm_t = et / S_t  # [B, K]
         bm_a = ea / S_a
         bm_v = ev / S_v
         
-        # Step 3: 归一化belief用于冲突度计算（论文Eq. 8）
-        # 当 u_m 接近1时（无证据），退化为均匀分布
+        # 6.3 归一化belief用于冲突度计算（论文Eq. 8）
         eps_norm = 1e-6
         belief_sum_t = bm_t.sum(dim=1, keepdim=True)  # [B, 1]，应≈1-u_m
         belief_sum_a = bm_a.sum(dim=1, keepdim=True)
@@ -413,30 +366,27 @@ class UTL_MELT(nn.Module):
             torch.ones_like(bm_v) / K
         )
         
-        # Step 4: 计算冲突度（论文Eq. 9）
-        # C_m = 1 - <b̃_m, b̃_prev(m)>
+        # 6.4 计算冲突度（论文Eq. 9）
         C_a = 1.0 - (b_tilde_a * b_tilde_t).sum(dim=1)  # [B] Audio vs Text
         C_v = 1.0 - (b_tilde_v * b_tilde_a).sum(dim=1)  # [B] Visual vs Audio
-        
-        # 限制在[0,1]区间
         C_a = torch.clamp(C_a, 0.0, 1.0)
         C_v = torch.clamp(C_v, 0.0, 1.0)
         
-        # Step 5: 计算prefix权重（论文Eq. 10）
+        # 6.5 计算prefix权重（论文Eq. 10）
         u_t_scalar = u_t.squeeze(1)  # [B]
         u_a_scalar = u_a.squeeze(1)
         u_v_scalar = u_v.squeeze(1)
         
-        w_t = 1.0 - u_t_scalar              # Text: 1 - u^(1)
-        w_a = (1.0 - u_a_scalar) * (1.0 - C_a)  # Audio: (1-u^(2))(1-C^(2))
-        w_v = (1.0 - u_v_scalar) * (1.0 - C_v)  # Visual: (1-u^(3))(1-C^(3))
+        w_t = 1.0 - u_t_scalar                      # Text: 1 - u^(1)
+        w_a = (1.0 - u_a_scalar) * (1.0 - C_a)      # Audio: (1-u^(2))(1-C^(2))
+        w_v = (1.0 - u_v_scalar) * (1.0 - C_v)      # Visual: (1-u^(3))(1-C^(3))
         
         w_pref = torch.stack([w_t, w_a, w_v], dim=1)  # [B, 3]
         
-        # Step 6: Temperature-controlled softmax（论文Eq. 11）
+        # 6.6 Temperature-controlled softmax（论文Eq. 11）
         a_tilde = F.softmax(w_pref / self.CONFIG['prefix_temp'], dim=1)  # [B, 3]
         
-        # Step 7: 不确定性门控（论文Eq. 12）
+        # 6.7 不确定性门控（论文Eq. 12）
         u_stack = torch.cat([u_t, u_a, u_v], dim=1)  # [B, 3]
         
         if self.CONFIG["enable_uncertainty_gate"]:
@@ -451,18 +401,19 @@ class UTL_MELT(nn.Module):
         else:
             w_unc = torch.ones_like(u_stack) / 3.0
         
-        # Step 8: 混合融合（论文Eq. 13-14）
+        # 6.8 混合融合（论文Eq. 13-14）
         w_hat = a_tilde * w_unc  # [B, 3]
         wexp = w_hat * torch.exp(-u_stack)  # [B, 3]
         alpha = wexp / (wexp.sum(dim=1, keepdim=True) + eps)  # [B, 3] 最终权重
         
         e_final = (alpha.unsqueeze(-1) * E).sum(dim=1)  # [B, K]
         
-        # 返回
+        # ========== Step 7: 返回 ==========
         if return_intermediates:
             return e_final, (et, ea, ev), u_stack
         else:
             return e_final, (et, ea, ev)
+            
 # ---------- 6. 复合损失 ----------
 class CompositeLossUTL(nn.Module):
     def __init__(self, freq: List[int], num_cls: int = 7):
