@@ -238,26 +238,27 @@ class ResidualAdapter(nn.Module):
     def __init__(self, hid, bn=64): super().__init__(); self.down=nn.Linear(hid,bn); self.up=nn.Linear(bn,hid)
     def forward(self, x): return x + self.up(F.relu(self.down(x)))
 
-class CrossAttn(nn.Module):
+class SharedCrossAttn(nn.Module):
     def __init__(self, d_model=256, n_heads=4):
         super().__init__()
-        self.q = nn.Linear(d_model, d_model)
-        self.k = nn.Linear(2 * d_model, d_model)  # KV输入=2*d_model
-        self.v = nn.Linear(2 * d_model, d_model)  # 适配拼接维度
+        # 为拼接的KV设计投影层
+        self.kv_proj = nn.Linear(2 * d_model, d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.out  = nn.Linear(d_model, d_model)
     
-    def forward(self, q_in, kv_in):
+    def forward(self, query, key_value):
         """
         Args:
-            q_in: [B, d_model] 查询模态
-            kv_in: [B, 2*d_model] 拼接的键值模态
+            query: [B, d] 当前模态
+            key_value: [B, 2*d] 其他两个模态拼接
+        Returns:
+            [B, d] 对齐后的特征
         """
-        q = self.q(q_in).unsqueeze(1)      # [B, 1, d_model]
-        k = self.k(kv_in).unsqueeze(1)     # [B, 1, d_model]
-        v = self.v(kv_in).unsqueeze(1)     # [B, 1, d_model]
-        y, _ = self.attn(q, k, v, need_weights=False)
-        return self.out(y.squeeze(1))      # [B, d_model]
+        q = query.unsqueeze(1)          # [B, 1, d]
+        kv = self.kv_proj(key_value)    # [B, 2d] -> [B, d]
+        kv = kv.unsqueeze(1)            # [B, 1, d]
+        
+        out, _ = self.attn(q, kv, kv, need_weights=False)
+        return out.squeeze(1)           # [B, d]
 
 class EvidenceHead(nn.Module):
     def __init__(self, d, num_cls): super().__init__(); self.fc=nn.Linear(d,num_cls)
@@ -272,7 +273,7 @@ class UTL_MELT(nn.Module):
         self.aud = AudioBranch(d)
         self.vis = VisualBranch(d)
         if CONFIG["enable_cross_modal_align"]:
-            self.shared_align = CrossAttn(d)  # 只有一个，共享参数
+            self.shared_align = SharedCrossAttn(d)  # 只有一个，共享参数
         else:
             self.shared_align = None
         self.adp_t = ResidualAdapter(d)
@@ -299,11 +300,11 @@ class UTL_MELT(nn.Module):
         # ========== Step 3: 跨模态对齐（论文Eq. 2-4） ==========
         if self.CONFIG["enable_cross_modal_align"]:
             # Text查询Audio+Visual的拼接
-            ft1 = self.align_t(ft0, torch.cat([fa0, fv0], dim=-1))
+            ft1 = self.shared_align(ft0, torch.cat([fa0, fv0], dim=-1))
             # Audio查询Text+Visual的拼接
-            fa1 = self.align_a(fa0, torch.cat([ft0, fv0], dim=-1))
+            fa1 = self.shared_align(fa0, torch.cat([ft0, fv0], dim=-1))
             # Visual查询Text+Audio的拼接
-            fv1 = self.align_v(fv0, torch.cat([ft0, fa0], dim=-1))
+            fv1 = self.shared_align(fv0, torch.cat([ft0, fa0], dim=-1))
         else:
             ft1, fa1, fv1 = ft0, fa0, fv0
 
@@ -390,15 +391,15 @@ class UTL_MELT(nn.Module):
             kappa = self.CONFIG['kappa']
             
             reliable = (u_stack <= tau).float()
-            w_unc = reliable + (1 - reliable) * torch.clamp(
+            w_gate = reliable + (1 - reliable) * torch.clamp(
                 1.0 - kappa * (u_stack - tau),
                 min=0.01
             )  # [B, 3]
         else:
-            w_unc = torch.ones_like(u_stack) / 3.0
+            w_gate = torch.ones_like(u_stack) / 3.0
         
         # 6.8 混合融合（论文Eq. 13-14）
-        w_hat = a_tilde * w_unc  # [B, 3]
+        w_hat = a_tilde * w_gate  # [B, 3]
         wexp = w_hat * torch.exp(-u_stack)  # [B, 3]
         alpha = wexp / (wexp.sum(dim=1, keepdim=True) + eps)  # [B, 3] 最终权重
         
