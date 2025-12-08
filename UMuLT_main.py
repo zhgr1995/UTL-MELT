@@ -39,7 +39,7 @@ CONFIG: Dict = {
     "ldam_C":             1,#C 越大 → 对尾部类别 margin 增大，模型对尾部更“宽容”；C 越小 → margin 减弱，更接近无边界的 CLF。
     "ema_mom":            0.995,#m 越大 → 历史统计更平滑，对短期波动不敏感；m 越小 → 更快响应当前 batch 失衡。
     "alpha_fair":         0.65,#α 越大 → 对高历史 loss 类别（通常是尾部）加大惩罚；α 越小 → 各类别权重趋于一致。越低越好
-    "lambda_cons":        0.80,#λ_cons 越大 → 强化模态间一致性，有助于尾部样本。
+    "lambda_cons":        0.80/7,#λ_cons 越大 → 强化模态间一致性，有助于尾部样本。
     "sampler_replacement": True,# 样本采样有放回，提升尾部样本曝光频率
     "async_av_k":         1,#=1：文本、音、视同步更新；>1：每 k 步更新一次音/视，文本更新更频繁。
     "audio_len":          100,   # 固定MFCC序列长度
@@ -272,13 +272,9 @@ class UTL_MELT(nn.Module):
         self.aud = AudioBranch(d)
         self.vis = VisualBranch(d)
         if CONFIG["enable_cross_modal_align"]:
-            self.align_t = CrossAttn(d)
-            self.align_a = CrossAttn(d)
-            self.align_v = CrossAttn(d)
+            self.shared_align = CrossAttn(d)  # 只有一个，共享参数
         else:
-            self.align_t = None
-            self.align_a = None
-            self.align_v = None
+            self.shared_align = None
         self.adp_t = ResidualAdapter(d)
         self.adp_a = ResidualAdapter(d)
         self.adp_v = ResidualAdapter(d)
@@ -346,23 +342,23 @@ class UTL_MELT(nn.Module):
         
         # 6.3 归一化belief用于冲突度计算（论文Eq. 8）
         eps_norm = 1e-6
-        belief_sum_t = bm_t.sum(dim=1, keepdim=True)  # [B, 1]，应≈1-u_m
-        belief_sum_a = bm_a.sum(dim=1, keepdim=True)
-        belief_sum_v = bm_v.sum(dim=1, keepdim=True)
+        one_minus_u_t = 1.0 - u_t
+        one_minus_u_a = 1.0 - u_a
+        one_minus_u_v = 1.0 - u_v
         
         b_tilde_t = torch.where(
-            belief_sum_t >= eps_norm,
-            bm_t / (belief_sum_t + eps_norm),
+            one_minus_u_t >= eps_norm,
+            bm_t / (one_minus_u_t + eps_norm),
             torch.ones_like(bm_t) / K
-        )  # [B, K]
+        )
         b_tilde_a = torch.where(
-            belief_sum_a >= eps_norm,
-            bm_a / (belief_sum_a + eps_norm),
+            one_minus_u_a >= eps_norm,
+            bm_a / (one_minus_u_a + eps_norm),
             torch.ones_like(bm_a) / K
         )
         b_tilde_v = torch.where(
-            belief_sum_v >= eps_norm,
-            bm_v / (belief_sum_v + eps_norm),
+            one_minus_u_v >= eps_norm,
+            bm_v / (one_minus_u_v + eps_norm),
             torch.ones_like(bm_v) / K
         )
         
@@ -438,7 +434,7 @@ class CompositeLossUTL(nn.Module):
             gamma = (1 - CONFIG['beta_cb']) / (1 - CONFIG['beta_cb'] ** self.freq[y])
             base = F.cross_entropy(adj_logits, y, reduction='none') * gamma
         else:
-            # Standard cross entropy
+            # cross entropy
             base = F.cross_entropy(logits, y, reduction='none')
 
         # ===== EMA-Fairness 权重（只读，不在这里更新 EMA） =====
@@ -450,9 +446,9 @@ class CompositeLossUTL(nn.Module):
         # 一致性损失（由 lambda_cons 控制）
         et, ea, ev = evidences
         cons_loss = CONFIG['lambda_cons'] * (
-            F.mse_loss(et, ea, reduction='mean') +
-            F.mse_loss(et, ev, reduction='mean') +
-            F.mse_loss(ea, ev, reduction='mean')
+            (et - ea).pow(2).sum(dim=1).mean() +
+            (et - ev).pow(2).sum(dim=1).mean() +
+            (ea - ev).pow(2).sum(dim=1).mean()
         )
 
         # 总loss = 权重 * 基loss + 一致性
