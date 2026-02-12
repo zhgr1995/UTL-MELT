@@ -1,5 +1,5 @@
 # UMuLT (aka UTL-MELT)
-
+#Quantifying Epistemic Uncertainty in Multimodal Long-Tailed Classification: A Belief Entropy-Based Evidential Fusion Framewor#
 
 
 > This repository implements the UMuLT framework (original code name: UTL-MELT) proposed in the paper.
@@ -134,10 +134,10 @@ If you use this code or method, please cite:
 
 ```bibtex
 @article{your2025umult,
-  title   = {UMuLT: Unified Multimodal Long-Tailed Classification with Uncertainty-Driven Fusion},
-  author  = {Your Name and ...},
-  journal = {XXXX},
-  year    = {2025}
+  title   = {Quantifying Epistemic Uncertainty in Multimodal Long-Tailed Classification: A Belief Entropy-Based Evidential Fusion Framework},
+  author  = {Guorui Zhu},
+  journal = {Entropy},
+  year    = {2026}
 }
 ```
 
@@ -207,7 +207,7 @@ python utl_melt.py --lambda_cons 0.8 --alpha_fair 0.65 --tau_unc 0.08
 
 # UMuLT (aka UTL-MELT)
 
-**Unified Multimodal Long-Tailed Classification with Uncertainty-Driven Fusion**
+**Quantifying Epistemic Uncertainty in Multimodal Long-Tailed Classification: A Belief Entropy-Based Evidential Fusion Framewor**
 
 > 本仓库实现了论文中提出的 UMuLT 框架（原始代码名为 UTL-MELT）。该方法针对多模态长尾分布数据，结合证据理论的不确定性建模、冲突感知的前缀加权、EMA 公平重加权以及两阶段课程训练，实现鲁棒的文本-音频-视觉三模态分类。
 
@@ -343,10 +343,10 @@ python utl_melt.py \
 
 ```bibtex
 @article{your2025umult,
-  title   = {UMuLT: Unified Multimodal Long-Tailed Classification with Uncertainty-Driven Fusion},
-  author  = {Your Name and ...},
-  journal = {XXXX},
-  year    = {2025}
+  title   = {Quantifying Epistemic Uncertainty in Multimodal Long-Tailed Classification: A Belief Entropy-Based Evidential Fusion Framewor},
+  author  = {Guorui Zhu},
+  journal = {Entropy},
+  year    = {2026}
 }
 ```
 
